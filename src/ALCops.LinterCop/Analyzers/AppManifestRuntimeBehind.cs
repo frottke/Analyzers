@@ -20,7 +20,17 @@ public sealed class AppManifestRuntimeBehind : DiagnosticAnalyzer
 
     private void CheckAppManifestRuntime(CompilationAnalysisContext ctx)
     {
-        NavAppManifest? manifest = ManifestHelper.GetManifest(ctx.Compilation);
+        NavAppManifest? manifest;
+        try
+        {
+            manifest = ManifestHelper.GetManifest(ctx.Compilation);
+        }
+        catch (Exception)
+        {
+            // Manifest loading can fail for reasons other than FileNotFoundException (e.g. FileLoadException on
+            // assembly binding conflicts in real compiler hosts); any failure here must not abort this analyzer.
+            return;
+        }
 
         // In the case the runtime version isn't specified in the app.json it returns the RuntimeVersion.CurrentRelease
         if (manifest is null || manifest.Runtime is null || manifest.Runtime == RuntimeVersion.CurrentRelease)

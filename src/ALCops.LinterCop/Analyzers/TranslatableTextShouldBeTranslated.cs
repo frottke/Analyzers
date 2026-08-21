@@ -48,8 +48,11 @@ public sealed class TranslatableTextShouldBeTranslated : DiagnosticAnalyzer
         {
             manifest = ManifestHelper.GetManifest(compilation);
         }
-        catch (FileNotFoundException)
+        catch (Exception)
         {
+            // Manifest loading can fail for reasons other than FileNotFoundException (e.g. FileLoadException on
+            // assembly binding conflicts in real compiler hosts); any failure here must not abort registration
+            // of the symbol actions below, or the whole rule silently stops reporting for the entire compilation.
             manifest = null;
         }
 
@@ -295,8 +298,10 @@ public sealed class TranslatableTextShouldBeTranslated : DiagnosticAnalyzer
         {
             xliffFiles = LanguageFileUtilities.GetXliffLanguageFiles(fileSystem, appName);
         }
-        catch (DirectoryNotFoundException)
+        catch (Exception)
         {
+            // Same rationale as the manifest load above: any failure discovering XLIFF files (not just
+            // DirectoryNotFoundException) must not abort the whole rule for the entire compilation.
             if (languageFilter is { Count: > 0 })
                 return new TranslationIndex(
                     new HashSet<string>(languageFilter, StringComparer.OrdinalIgnoreCase),

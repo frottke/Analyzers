@@ -4,6 +4,7 @@ using ALCops.Common.Extensions;
 using ALCops.Common.Reflection;
 using Microsoft.Dynamics.Nav.CodeAnalysis;
 using Microsoft.Dynamics.Nav.CodeAnalysis.Diagnostics;
+using Microsoft.Dynamics.Nav.CodeAnalysis.Packaging;
 
 namespace ALCops.PlatformCop.Analyzers;
 
@@ -55,7 +56,18 @@ public sealed class AccessPropertyExplicitlySet : DiagnosticAnalyzer
     private static bool IsEnumOrInterfaceAccessSupported(Compilation compilation)
         => EnumOrInterfaceAccessSupportedCache.GetOrAdd(compilation, static c =>
         {
-            var manifest = ManifestHelper.GetManifest(c);
+            NavAppManifest? manifest;
+            try
+            {
+                manifest = ManifestHelper.GetManifest(c);
+            }
+            catch (Exception)
+            {
+                // Manifest loading can fail for reasons other than FileNotFoundException (e.g. FileLoadException on
+                // assembly binding conflicts in real compiler hosts); any failure here must not abort this analyzer.
+                return false;
+            }
+
             return manifest is not null && manifest.Runtime >= RuntimeVersion.Spring2021;
         });
 }

@@ -31,7 +31,8 @@ These decisions were made during the initial design and should be preserved unle
 | Extension root symbol | `ExtensionObjectFoldingUtilities.GetTranslationRootSymbol` SDK API | Fixes the multi-extension bug in the original rule; correctly handles all cases |
 | Translation ID generation | `LanguageFileUtilities` via **runtime reflection** (`GetTranslationFileId` on new SDKs, public 2-param `GetLanguageSymbolId` / `GetLabelTextConstLanguageSymbolId` on older SDKs) | The public methods gained an optional `useNamespaces` param in `18.0.38.52553`; C# bakes optional-param call sites at compile time, so a direct call breaks across SDK versions (see Known issues). Reflection picks the right method at runtime and supports namespace-aware IDs. |
 | Canonical property-name override | Passed only when `manifest.Runtime > RuntimeVersion.Spring2020CU1` (or runtime unknown → treat as "current") | Mirrors `SymbolExtensions.GetTranslationName`: the compiler uses `PropertyKind.ToString()` on new runtimes but source-cased `symbol.Name` on runtime ≤ 5.1. Unconditional override regresses legacy apps (source-cased hash ≠ canonical hash → false positive). Gate is applied on the LinterCop side; `TranslationIdHelper.ComputeTranslationId(nameOverride: null)` falls through to `symbol.Name`. |
-| ManifestHelper exception handling | Catch `FileNotFoundException` and treat as null manifest | `ManifestHelper.GetManifest` loads `Microsoft.Dynamics.Nav.Analyzers.Common` assembly via reflection; this assembly isn't present in test contexts |
+| ManifestHelper exception handling | Catch `Exception` (any type) and treat as null manifest | `ManifestHelper.GetManifest` loads `Microsoft.Dynamics.Nav.Analyzers.Common` assembly via reflection; this assembly isn't present in test contexts. On net8.0+ the SDK call has no reflection safety net, so real compiler hosts can throw exception types other than `FileNotFoundException` (e.g. `FileLoadException` on assembly binding conflicts) — see Known issues. |
+| XLIFF discovery exception handling | Catch `Exception` (any type) around `LanguageFileUtilities.GetXliffLanguageFiles` | Same rationale as the manifest catch above: any failure discovering XLIFF files (not just `DirectoryNotFoundException`) must not abort the whole rule for the entire compilation. |
 | Null manifest behavior | Proceed with analysis (don't skip) | Tests create minimal compilations without manifests; real projects always have manifests |
 | XLIFF caching | Load once in CompilationStartAction | Avoid re-parsing per symbol |
 | Settings | `LanguagesToTranslate` array in `alcops.json` | Override semantics: when set, these are the available languages (XLIFF files only parsed for matching languages); when unset, discover from XLIFF files |
@@ -65,7 +66,7 @@ Uses `RegisterCompilationStartAction` to load and parse XLIFF files once per com
 
 1. **CompilationStartAction**:
    - Get `IFileSystem` from compilation (exit if null)
-   - Get `NavAppManifest` via `ManifestHelper.GetManifest` (catch `FileNotFoundException` for test compatibility)
+   - Get `NavAppManifest` via `ManifestHelper.GetManifest` (catch `Exception`, any type — see Known issues)
    - Check `CompilerFeatures.ShouldGenerateTranslationFile()` (skip if explicitly disabled)
    - Load `ALCopsSettings` for `LanguagesToTranslate` filter
    - Build `TranslationIndex` from all XLIFF files (exit if no files or no languages)
@@ -96,6 +97,18 @@ When a translation ID is not found in the index at all, ALL available languages 
 `ManifestHelper.GetManifest(compilation)` loads `Microsoft.Dynamics.Nav.Analyzers.Common` assembly via reflection. In test contexts (minimal compilations without the full SDK runtime), this assembly isn't available, causing a `FileNotFoundException`. The analyzer catches this and treats it as null manifest.
 
 This is NOT an SDK bug; it's a consequence of running analyzers in a test environment with minimal dependencies. The `CompilationWithAnalyzers` pipeline silently swallows exceptions from analyzer callbacks, making this extremely hard to diagnose without explicit try-catch.
+
+### Silent zero-diagnostic failure in real compiler hosts (narrow catch clause)
+
+The original catch clauses around `ManifestHelper.GetManifest` and `LanguageFileUtilities.GetXliffLanguageFiles` only caught `FileNotFoundException` / `DirectoryNotFoundException` respectively. On net8.0+, `ManifestHelper.GetManifest` calls the SDK directly with no reflection safety net, so a real compiler host can throw a different exception type (e.g. `FileLoadException` on assembly binding conflicts). An uncaught exception in `OnCompilationStart` aborts the callback **before** `context.RegisterSymbolAction(...)` runs, so the rule would silently report **zero** diagnostics for the entire compilation — no `AD0001`-style crash diagnostic is surfaced by the AL compiler host, making this failure mode invisible without external instrumentation.
+
+**Fix:** broaden both catch clauses to `catch (Exception)`, consistent with the already-documented "proceed with analysis on null manifest" design intent. This is a defensive hardening, not a confirmed fix for any specific reported symptom in this rule — a debug-logged A/B test (narrow vs. broad catch) against a real project never observed either catch clause firing at all. `ManifestHelper.GetManifest` throwing `FileNotFoundException` from a genuine assembly binding conflict (not a test-context artifact) **was** independently confirmed live for three other rules (`AppManifestRuntimeBehind`/LC0033, `InternalProcedureNotReferenced`/LC0052, `AccessPropertyExplicitlySet`/PC0006), which is why those call sites received the same broadened catch.
+
+### Root cause of the originally reported zero-diagnostic symptom: `MissingMethodException`, not the catch clauses
+
+A real-world report of LC0091 producing zero diagnostics was initially (incorrectly) attributed to the narrow catch clauses above. Rigorous debugging (file-based instrumentation, then an A/B test narrowing the catch back) proved the catch clauses were never the cause — no exception was ever thrown in the manifest/XLIFF loading paths during testing.
+
+The actual cause: the affected project was running an outdated **stable release** (`v1.0.1`) that predates `ALCops.Common/Reflection/TranslationIdHelper.cs` (introduced in PR #391 / commit `872069e`). That release calls the SDK's `LanguageFileUtilities.GetLanguageSymbolId`/`GetLabelTextConstLanguageSymbolId` directly with a 2-parameter signature baked in at compile time; against SDK `18.0.38.52553`+ (which added an optional `useNamespaces` parameter) this throws `MissingMethodException`, aborting `OnCompilationStart` before symbol registration — same failure shape as the theoretical narrow-catch scenario above, but a different exception type and a different (already-fixed-in-`main`) cause. Verified by building and deploying a clean, unmodified `main` checkout (via an isolated git worktree, no session changes) and confirming LC0091 works correctly. See "SDK 18.0.38.52553: optional-parameter break on translation-ID methods" below for the fix already present on `main`.
 
 ### BoundObjectAccess (shared with PC0030)
 
